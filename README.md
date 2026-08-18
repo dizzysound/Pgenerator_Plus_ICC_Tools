@@ -17,15 +17,25 @@ Download current builds from the [latest release](../../releases/latest).
 | `PGeneratorPlus-ICC-Tools-Portable-Windows-x64.zip` | Windows 10/11 x64 | Portable versions of the same programs |
 | `PGeneratorPlus-ICC-Tools-Linux-x64.zip` | x86-64 Linux with glibc 2.38 or newer | Patch Companion, Profile Loader, ArgyllCMS `colprof` and `profcheck`, bundled SDL3, and the KDE HDR tone-mapping reset helper |
 | `PGeneratorPlus-ICC-Tools-ArchLinux-x86_64.pkg.tar.zst` | Arch Linux x86-64 | Native package of the Linux tools, installed under `/opt/pgen-icc-tools` with commands linked into `/usr/bin` |
+| `PGeneratorPlus-ICC-Tools-macOS-arm64.dmg` | macOS 14+ on Apple Silicon, experimental | Disk image with Patch Companion, ArgyllCMS `colprof` and `profcheck`; HDR presents through Metal EDR, and profile installing is not offered on macOS |
 
 The Windows builds are not code-signed, so Windows may show a SmartScreen
 warning.
 
 ## Current release
 
-Version 1.4.19 is paired with the pgen25 KWin build. The Patch Companion in
-this release:
+Version 1.4.20 is paired with the current PGenerator+ build. The desktop tools
+in this release:
 
+- preserve Windows MHC2 correction while OLED protection patches are inserted;
+- classify Windows SDR and Advanced Color profile associations from ICC
+  content, including PGenerator+'s explicit association marker, instead of
+  relying on the file name;
+- replace stale same-named profiles in the Windows color store and verify the
+  installed bytes;
+- preserve a saved Advanced Color association for unmarked vendor profiles;
+- reload Windows Advanced Color after an MHC2 profile changes and wait for the
+  reload before reporting that the profile is ready;
 - bundles a colprof build that fills B2A tables across worker processes on
   Linux, cutting local profile fitting time roughly in half on multi-core
   machines while producing byte-identical profiles;
@@ -62,6 +72,9 @@ this release:
   build as complete.
 
 The Linux archive and Arch package also contain `reset-hdr-tonemapping.sh`.
+The bundled `colprof` and `profcheck` binaries are built from the pinned
+`ArgyllCMS_ICC4.4` submodule at commit `0613c3f` (`argyll-4.4-icc44-pgen1`),
+including the ICC 4.4/CICP support and the Linux parallel B2A table builder.
 The release `SHA256SUMS` file covers all downloads.
 
 ### Installing a completed profile from the WebUI

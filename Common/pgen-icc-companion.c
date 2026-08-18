@@ -3,6 +3,10 @@
  * Displays measurement patches through the target computer's native output
  * pipeline. Windows uses a native DXGI HDR10 swapchain so PQ/BT.2020 patch
  * codes reach the operating-system HDR pipeline without scRGB remapping.
+ * Linux drives a Wayland PQ/BT.2020 surface for the same reason. macOS has no
+ * PQ surface to offer, so it presents through SDL's Metal EDR path with the
+ * PQ decode done locally - a stable code-to-light mapping rather than an
+ * absolute one.
  */
 
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -111,8 +115,8 @@ static int reap_profile_loader(void *opaque)
 }
 #endif
 
-#define APP_VERSION "1.4.19"
-#define APP_BUILD "1"
+#define APP_VERSION "1.4.21"
+#define APP_BUILD "2"
 #define APP_TITLE "PGenerator+ Patch Companion " APP_VERSION " (build " APP_BUILD ")"
 /* Width in source code units over which the grey-axis calibration blends into
  * the cLUT result. */
@@ -125,6 +129,11 @@ typedef struct {
     struct wl_display *display;
     struct wp_color_manager_v1 *manager;
     struct wp_color_management_surface_v1 *surface;
+    /* The wl_surface the color surface above was created for. SDL recreates
+     * the window surface on renderer fallback, and a request on a color
+     * surface whose wl_surface is gone is a protocol error that fatally
+     * closes the display connection. */
+    struct wl_surface *bound_surface;
     bool parametric;
     bool set_primaries;
     bool luminances;
@@ -350,9 +359,22 @@ static bool pgen_wayland_set_hdr_surface(SDL_Window *window, bool hdr,
         wl_registry_destroy(registry);
         if (!wayland_color.manager)
             return SDL_SetError("KWin does not expose color-management-v1");
+    }
+    if (wayland_color.surface && wayland_color.bound_surface != wl_surface) {
+        /* SDL recreated the window surface (renderer fallback, display
+         * move). The color surface still references the destroyed
+         * wl_surface, and any request on it makes KWin close the whole
+         * display connection. Drop it and bind the current surface. */
+        wp_color_management_surface_v1_destroy(wayland_color.surface);
+        wayland_color.surface = NULL;
+        wayland_color.bound_surface = NULL;
+    }
+    if (!wayland_color.surface) {
+        if (!hdr) return true;
         SDL_Log("Creating Wayland color-management surface (hdr=%d)", hdr ? 1 : 0);
         wayland_color.surface = wp_color_manager_v1_get_surface(
             wayland_color.manager, wl_surface);
+        wayland_color.bound_surface = wl_surface;
     }
 
     SDL_Log("Setting Wayland surface color state hdr=%d manager=%p surface=%p",
@@ -549,6 +571,13 @@ typedef struct {
     SDL_Mutex *network_mutex;
     SDL_AtomicInt quit_requested;
     SDL_AtomicInt install_in_progress;
+    /* Set by the install worker when the Profile Loader finished applying a
+     * profile: the loader cycles Advanced Color underneath this process, and
+     * a swapchain created before that cycle can survive demoted to composed
+     * presentation, where Windows tone-maps output to the profile-reported
+     * peak. Consumed on the main thread by recreating the renderer before
+     * the next fullscreen HDR patch is displayed. */
+    SDL_AtomicInt presentation_recovery_pending;
     bool command_pending;
     uint64_t refresh_until_ms;
     uint64_t command_sequence;
@@ -557,6 +586,7 @@ typedef struct {
     double command_max_luma, command_min_luma;
     double command_max_cll, command_max_fall;
     int command_size;
+    bool command_preserve_hdr_calibration;
     char command_mode[32];
     bool settings_pending;
     bool settings_fullscreen;
@@ -649,6 +679,7 @@ static unsigned long pgen_nvapi_display_id;
 static int pgen_nvapi_original_tone_mapping;
 static int pgen_nvapi_last_status;
 static bool pgen_nvapi_source_active;
+static UINT pgen_adapter_vendor_id;
 static bool pgen_nvapi_tone_mapping_saved;
 static bool pgen_nvapi_metadata_valid;
 static PgenNvHdrMetadata pgen_nvapi_metadata;
@@ -1161,7 +1192,7 @@ display_selected:
                     sizeof(app.selected_display));
         app.selected_display_id = target;
         SDL_GetWindowSize(app.window, &width, &height);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
         /* Wayland ignores most SetWindowPosition calls. The reliable way to
          * land on a chosen output is to recreate the window with
          * SDL_WINDOWPOS_CENTERED_DISPLAY and then enter borderless fullscreen
@@ -1382,6 +1413,8 @@ static bool load_config(CompanionConfig *config, int argc, char *argv[])
         DWORD size = (DWORD)sizeof(config->client);
         if (!GetComputerNameA(config->client, &size)) SDL_strlcpy(config->client, "Windows-PC", sizeof(config->client));
     }
+#elif defined(__APPLE__)
+    if (gethostname(config->client, sizeof(config->client) - 1) != 0) SDL_strlcpy(config->client, "Mac", sizeof(config->client));
 #else
     if (gethostname(config->client, sizeof(config->client) - 1) != 0) SDL_strlcpy(config->client, "Linux-PC", sizeof(config->client));
 #endif
@@ -1655,10 +1688,10 @@ static bool companion_tool_path(const char *name, char *out, size_t out_size)
     return true;
 }
 
-/* Which build this is; only these two are packaged. Reported so the server can
- * describe what is genuinely unavailable instead of showing an empty value as a
- * failure: reading the display's active ICC profile, and the active-profile
- * transforms that depend on it, are Windows-only. */
+/* Which build this is; only these three are packaged. Reported so the server
+ * can describe what is genuinely unavailable instead of showing an empty value
+ * as a failure - installing a finished profile through the Profile Loader, for
+ * example, exists on Windows and Linux but not on macOS. */
 static const char *companion_platform(void)
 {
 #ifdef _WIN32
@@ -1997,7 +2030,10 @@ static bool apply_mhc2_inverse(double rgb[3])
  * application-side correction modes nothing else loads that table, so the
  * Companion applies it to the transform output here. HDR profiles that need
  * grey-axis tracking beyond what a downstream 1D stage can express must
- * incorporate the calibration into BToA instead of shipping a vcgt tag. */
+ * incorporate the calibration into BToA instead of shipping a vcgt tag.
+ * macOS is the exception and compiles this out: ColorSync loads the active
+ * profile's vcgt into the display pipe itself. */
+#ifndef __APPLE__
 static bool apply_vcgt(double rgb[3])
 {
     IccTag tag=icc_tag(app.correction_profile_data,app.correction_profile_size,"vcgt");
@@ -2024,6 +2060,7 @@ static bool apply_vcgt(double rgb[3])
     }
     return true;
 }
+#endif
 
 static bool apply_local_mhc2(const double input[3], double output[3])
 {
@@ -2076,6 +2113,10 @@ static bool load_correction_lut(uint64_t revision)
         app.correction_ready = false;
 #ifdef _WIN32
         SDL_strlcpy(app.correction_error, "The operating system did not report an active ICC profile for the selected display", sizeof(app.correction_error));
+#elif defined(__APPLE__)
+        SDL_strlcpy(app.correction_error,
+                    "ColorSync did not report a profile for the selected display",
+                    sizeof(app.correction_error));
 #else
         /* Name the compositor and the slot: on Plasma 6.7 an HDR display has a
          * separate "HDR ICC profile" assignment, and a display with only the
@@ -2138,6 +2179,11 @@ static bool apply_correction_lut(double *red, double *green, double *blue)
          * DWM applies the active profile's MHC2 stage in both window modes, so
          * system handling must submit the source unchanged. Applying MHC2
          * locally here corrects fullscreen patches twice. */
+#elif defined(__APPLE__)
+        /* macOS composites every window through the display's assigned
+         * ColorSync profile on its own, and this build never toggles that OS
+         * state. "system" means exactly that native handling, so the patch
+         * passes through unchanged for the meter to measure it. */
 #else
         /* KWin composites the assigned profile itself, including in HDR from
          * Plasma 6.7 on, so there is nothing here to stand in for - applying
@@ -2178,9 +2224,16 @@ static bool apply_correction_lut(double *red, double *green, double *blue)
                 output[channel]=weight*direct[channel]+(1.0-weight)*output[channel];
         }
     }
+#ifndef __APPLE__
     /* Standard ICC order: vcgt runs on the transform's device output, exactly
      * where a video-card gamma table would. */
     apply_vcgt(output);
+#else
+    /* macOS loads the active profile's vcgt into the video-card gamma table
+     * itself, and this build leaves that OS state alone, so the calibration
+     * already runs after this transform - applying the tag here as well would
+     * run it twice. */
+#endif
     {
 #ifdef _WIN32
         /* DWM will apply MHC2 after either borderless or windowed presentation.
@@ -2489,6 +2542,11 @@ static bool windows_create_hdr_output(void)
         result = ID3D11Device_QueryInterface(app.hdr_device, &pgen_iid_idxgi_device,
                                              (void **)&dxgi_device);
     if (SUCCEEDED(result)) result = IDXGIDevice_GetAdapter(dxgi_device, &adapter);
+    if (SUCCEEDED(result)) {
+        DXGI_ADAPTER_DESC adapter_desc;
+        if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &adapter_desc)))
+            pgen_adapter_vendor_id = adapter_desc.VendorId;
+    }
     if (SUCCEEDED(result))
         result = IDXGIAdapter_GetParent(adapter, &pgen_iid_idxgi_factory2,
                                         (void **)&factory);
@@ -2542,16 +2600,30 @@ static bool windows_create_hdr_output(void)
         windows_destroy_hdr_output();
         return false;
     }
-    windows_nvapi_hdr_source_begin(app.window);
+    /* NVAPI only exists on NVIDIA: probing it on other vendors reported a
+     * loader sentinel (-2) as a driver error on every AMD and Intel machine.
+     * Name the actual path instead; the NVAPI error format is reserved for
+     * NVIDIA adapters where the status is a genuine NvAPI_Status. */
+    if (pgen_adapter_vendor_id == 0x10DE)
+        windows_nvapi_hdr_source_begin(app.window);
     app.hdr = true;
     app.hdr_active = windows_window_hdr_enabled(app.window);
     if (pgen_nvapi_source_active)
         SDL_strlcpy(app.renderer_name, "direct3d11-hdr10-nvapi-rec2100",
                     sizeof(app.renderer_name));
-    else
+    else if (pgen_adapter_vendor_id == 0x10DE)
         SDL_snprintf(app.renderer_name, sizeof(app.renderer_name),
                      "direct3d11-hdr10-nvapi-error-%d",
                      pgen_nvapi_last_status);
+    else if (pgen_adapter_vendor_id == 0x1002 || pgen_adapter_vendor_id == 0x1022)
+        SDL_strlcpy(app.renderer_name, "direct3d11-hdr10-amd",
+                    sizeof(app.renderer_name));
+    else if (pgen_adapter_vendor_id == 0x8086)
+        SDL_strlcpy(app.renderer_name, "direct3d11-hdr10-intel",
+                    sizeof(app.renderer_name));
+    else
+        SDL_strlcpy(app.renderer_name, "direct3d11-hdr10",
+                    sizeof(app.renderer_name));
     if (!app.hdr_active) {
         SDL_SetError("Windows HDR is not active on the selected display");
         windows_destroy_hdr_output();
@@ -2913,6 +2985,17 @@ static uint32_t kwin_hdr_surface_reference(SDL_DisplayID display)
 }
 #endif /* PGEN_LINUX */
 
+#ifdef __APPLE__
+/* What ColorSync says about the display the patches land on.
+ *
+ * SDL does not expose the CGDirectDisplayID behind one of its displays, so the
+ * SDL bounds rectangle is matched against CoreGraphics' global display bounds;
+ * both are top-left-origin desktop coordinates. macOS keeps one profile
+ * assignment per display - there is no separate SDR/HDR slot to choose
+ * between the way Plasma 6.7 has. */
+
+#endif
+
 static bool update_renderer_hdr_state(void)
 {
     SDL_PropertiesID renderer_props;
@@ -2940,6 +3023,26 @@ static bool update_renderer_hdr_state(void)
      * output description reflects the actual monitor pipeline in that case. */
     if (app.hdr && !app.hdr_active && windows_window_hdr_enabled(app.window))
         app.hdr_active = true;
+#elif defined(__APPLE__)
+    /* Metal EDR keeps presenting through the same linear surface in both
+     * modes, so unlike the other platforms there is no PQ output colorspace
+     * to double-check - only that the linear surface was actually granted. */
+    if (app.hdr && output_colorspace != SDL_COLORSPACE_SRGB_LINEAR) {
+        SDL_SetError("Renderer %s returned colorspace 0x%08x instead of linear EDR",
+                     app.renderer_name[0] ? app.renderer_name : "unknown",
+                     (unsigned int)output_colorspace);
+        app.hdr_active = false;
+        return false;
+    }
+    if (app.hdr && !app.hdr_active) {
+        /* Same gap as the other platforms: SDL derives its flag from the
+         * display's EDR headroom and can lag a brightness or reference-mode
+         * change, so the window's current headroom settles it. */
+        float headroom = SDL_GetFloatProperty(
+            SDL_GetWindowProperties(app.window),
+            SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 0.0f);
+        if (isfinite((double)headroom) && headroom > 1.0f) app.hdr_active = true;
+    }
 #else
     /* Same gap, other compositor. KWin does not always report HDR back to a
      * client through the colour-management protocol, so SDL's flag can stay
@@ -3202,12 +3305,23 @@ static bool try_create_renderer(bool hdr, const char *driver)
             SDL_Delay(20);
         } while (SDL_GetTicks() < hdr_deadline);
         if (!app.hdr_active) {
+#ifdef __APPLE__
+            /* On Apple displays the EDR headroom shrinks as the SDR
+             * brightness rises; at full brightness there is none left. */
+            SDL_SetError(
+                "The renderer did not enter HDR after its first presented frame "
+                "(driver=%s). macOS reports no EDR headroom for this display: "
+                "lower the display brightness or select a High Dynamic Range "
+                "preset in System Settings > Displays, then try again.",
+                app.renderer_name[0] ? app.renderer_name : (driver ? driver : "default"));
+#else
             SDL_SetError(
                 "The scRGB renderer did not enter HDR after its first presented frame "
                 "(driver=%s). On Linux install a working Vulkan stack "
                 "(vulkan-loader + mesa-vulkan-drivers or the vendor Vulkan package) "
                 "and enable HDR for this display in Plasma.",
                 app.renderer_name[0] ? app.renderer_name : (driver ? driver : "default"));
+#endif
             destroy_renderer();
             return false;
         }
@@ -3226,6 +3340,16 @@ static bool try_create_renderer(bool hdr, const char *driver)
     SDL_SetTextureScaleMode(app.background_texture, SDL_SCALEMODE_NEAREST);
     return true;
 }
+
+/* A failed HDR attempt is expensive: forced fullscreen, per-driver probes
+ * with multi-second waits, swapchain creation and teardown. The server keeps
+ * requesting patches while the condition persists (HDR disabled in the
+ * desktop, dead GPU stack), and retrying the whole gauntlet for every
+ * request pegs a core and can leak per attempt. Fail fast from the cached
+ * error during a cooldown; an HDR state change event clears it so enabling
+ * HDR in the desktop settings retries immediately. */
+static Uint64 hdr_attempt_cooldown_until;
+static char hdr_attempt_cached_error[512];
 
 static bool create_renderer(bool hdr)
 {
@@ -3246,9 +3370,18 @@ static bool create_renderer(bool hdr)
     char last_error[512] = "";
 
     if (!hdr) return try_create_renderer(false, NULL);
+    if (hdr_attempt_cooldown_until &&
+        SDL_GetTicks() < hdr_attempt_cooldown_until) {
+        return SDL_SetError("%s", hdr_attempt_cached_error[0]
+                            ? hdr_attempt_cached_error
+                            : "HDR renderer unavailable");
+    }
 #ifdef _WIN32
     destroy_renderer();
-    if (windows_create_hdr_output()) return true;
+    if (windows_create_hdr_output()) {
+        hdr_attempt_cooldown_until = 0;
+        return true;
+    }
     SDL_strlcpy(last_error, SDL_GetError(), sizeof(last_error));
 #else
     /* KWin only exposes an HDR-capable surface for some clients after the
@@ -3275,7 +3408,10 @@ static bool create_renderer(bool hdr)
     for (index = 0; index < SDL_arraysize(hdr_drivers); index++) {
         const char *driver = hdr_drivers[index];
         char attempt_summary[320];
-        if (try_create_renderer(true, driver)) return true;
+        if (try_create_renderer(true, driver)) {
+            hdr_attempt_cooldown_until = 0;
+            return true;
+        }
         attempt_error[0] = '\0';
         if (SDL_GetError() && SDL_GetError()[0])
             SDL_strlcpy(attempt_error, SDL_GetError(), sizeof(attempt_error));
@@ -3287,7 +3423,6 @@ static bool create_renderer(bool hdr)
         if (last_error[0]) SDL_strlcat(last_error, "; ", sizeof(last_error));
         SDL_strlcat(last_error, attempt_summary, sizeof(last_error));
     }
-#endif
 
     /* Keep the alignment target usable after an HDR failure, while preserving
      * the failure result so the server does not measure an SDR fallback. */
@@ -3295,6 +3430,9 @@ static bool create_renderer(bool hdr)
     if (app.renderer) render_alignment();
     SDL_SetError("HDR renderer unavailable: %s",
                  last_error[0] ? last_error : "No HDR renderer was available");
+    SDL_strlcpy(hdr_attempt_cached_error, SDL_GetError(),
+                sizeof(hdr_attempt_cached_error));
+    hdr_attempt_cooldown_until = SDL_GetTicks() + 5000;
     return false;
 }
 
@@ -3433,6 +3571,7 @@ static bool render_patch(const char *mode, double r, double g, double b)
         hdr_background = patch_to_hdr10(background_signal, background_signal, background_signal);
         if (!SDL_UpdateTexture(app.texture, NULL, &hdr_pixel, (int)sizeof(hdr_pixel))) return false;
         if (!SDL_UpdateTexture(app.background_texture, NULL, &hdr_background, (int)sizeof(hdr_background))) return false;
+#endif
     } else {
         patch_to_sdr_linear(r, g, b, pixel);
         patch_to_sdr_linear(background_signal, background_signal, background_signal, background);
@@ -3601,6 +3740,30 @@ static void activate_pattern_window(void)
     pgen_macos_activate_window(app.window);
 #endif
 }
+#ifdef _WIN32
+static void windows_verified_foreground(void)
+{
+    /* SetForegroundWindow is denied to background processes and the failure
+     * is silent: after the Profile Loader runs, the fullscreen HDR window can
+     * stay under the desktop's dim composed policy and every mid-band read
+     * sags 12-17%. A window restored from minimize is granted genuine
+     * foreground, mirroring the manual minimize/restore that recovers the
+     * bench. Verify with GetForegroundWindow and retry a bounded number of
+     * times rather than trusting the activation call. */
+    HWND window;
+    if (!app.fullscreen || !app.window) return;
+    window = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(app.window),
+                                          SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    if (!window) return;
+    for (int attempt = 0; attempt < 3 && GetForegroundWindow() != window; attempt++) {
+        ShowWindow(window, SW_MINIMIZE);
+        SDL_Delay(120);
+        ShowWindow(window, SW_RESTORE);
+        SDL_Delay(120);
+        windows_activate_pattern_window(window);
+    }
+}
+#endif
 
 static bool apply_display_settings(bool fullscreen, int patch_size)
 {
@@ -3880,7 +4043,7 @@ static void companion_run_install(const char *poll_response)
         companion_report_install(job, false, "Patch Companion could not download a valid ICC profile");
         return;
     }
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     profile_is_hdr = linux_profile_name_is_hdr(file) ||
                      profile_has_hdr_cicp(profile, profile_length);
 #endif
@@ -3942,6 +4105,12 @@ static void companion_run_install(const char *poll_response)
                 SDL_Delay(250);
             }
             remove(result_path);
+            /* The loader has just cycled Advanced Color under our swapchain;
+             * schedule a renderer recreate before the next HDR patch so a
+             * composed-demoted presentation cannot poison the following
+             * meter reads. */
+            if (accepted)
+                SDL_SetAtomicInt(&app.presentation_recovery_pending, 1);
         }
     }
 #elif defined(PGEN_MACOS)
@@ -4160,6 +4329,7 @@ static void poll_server(void)
     double sequence_value, r, g, b, input_max, code_min, code_max, poll_ms;
     double max_luma = 1000.0, min_luma = 0.005, max_cll = 1000.0, max_fall = 400.0;
     double settings_revision_value, display_size_value, patch_size_value;
+    double preserve_hdr_calibration_value = 0.0;
     uint64_t sequence;
     bool is_alignment, reported_hdr_active = false;
     double output_maximum_luminance = 0.0, output_full_frame_luminance = 0.0;
@@ -4184,12 +4354,13 @@ static void poll_server(void)
                            reported_hdr_active, app.windows_monitor_path,
                            SDL_arraysize(app.windows_monitor_path));
 #else
-    /* There is no DXGI swapchain and no OS presentation-mode query here, and no
-     * portable way to read the display's active ICC profile either. Report what
-     * this build genuinely knows - the colorspace the renderer presents in and
-     * the video backend carrying it - instead of a placeholder that reads as a
-     * failure. active_profile stays empty because none was read, not because
-     * none is installed. */
+    /* There is no DXGI swapchain and no OS presentation-mode query here.
+     * Report what this build genuinely knows - the colorspace the renderer
+     * presents in and the video backend carrying it - instead of a
+     * placeholder that reads as a failure. The active profile is filled in
+     * below by whichever platform owns the assignment, KWin or ColorSync;
+     * when neither reports one, active_profile stays empty because none was
+     * read, not because none is installed. */
     {
         SDL_PropertiesID renderer_props =
             app.renderer ? SDL_GetRendererProperties(app.renderer) : 0;
@@ -4510,6 +4681,7 @@ static void poll_server(void)
         SDL_LockMutex(app.network_mutex);
         app.command_sequence = sequence;
         app.command_alignment = true;
+        app.command_preserve_hdr_calibration = false;
         app.command_pending = true;
         SDL_UnlockMutex(app.network_mutex);
         app.next_poll_ms = SDL_GetTicks() + 50;
@@ -4567,6 +4739,8 @@ static void poll_server(void)
     app.command_max_fall = max_fall;
     app.command_size = 100;
     if (json_number(response, "size", &patch_size_value)) app.command_size = (int)patch_size_value;
+    json_number(response, "preserve_hdr_calibration", &preserve_hdr_calibration_value);
+    app.command_preserve_hdr_calibration = preserve_hdr_calibration_value != 0.0;
     SDL_strlcpy(app.command_mode, mode, sizeof(app.command_mode));
     app.command_pending = true;
     SDL_UnlockMutex(app.network_mutex);
@@ -4588,6 +4762,7 @@ static int SDLCALL network_thread_main(void *unused)
 static void process_network_updates(void)
 {
     bool have_command = false, alignment = false, status_dirty = false;
+    bool preserve_hdr_calibration = false;
     bool have_settings = false, settings_fullscreen = false;
     int command_size = 100, settings_size = 100;
     /* The stored patch size, captured whether or not settings arrived this
@@ -4621,6 +4796,7 @@ static void process_network_updates(void)
         max_luma = app.command_max_luma; min_luma = app.command_min_luma;
         max_cll = app.command_max_cll; max_fall = app.command_max_fall;
         command_size = app.command_size;
+        preserve_hdr_calibration = app.command_preserve_hdr_calibration;
         SDL_strlcpy(mode, app.command_mode, sizeof(mode));
         app.command_pending = false;
     }
@@ -4673,8 +4849,19 @@ static void process_network_updates(void)
             }
         }
 #ifdef _WIN32
-        bool refresh_fullscreen_hdr =
+        /* A completed profile install also forces the reset: the loader's
+         * Advanced Color cycle can leave this pre-existing swapchain demoted
+         * to composed presentation (Windows then tone-maps to the profile
+         * peak), and the size >= 100 gate below means windowed-patch sessions
+         * would otherwise never recover. Consuming it here keeps the reset in
+         * the inter-patch window, before the settle delay and meter read. */
+        bool install_recovery =
+            SDL_GetAtomicInt(&app.presentation_recovery_pending) != 0 &&
             app.fullscreen && !alignment && !strcmp(mode, "hdr10") &&
+            !preserve_hdr_calibration && app.hdr_swapchain;
+        bool refresh_fullscreen_hdr = install_recovery ||
+            (app.fullscreen && !alignment && !strcmp(mode, "hdr10") &&
+            !preserve_hdr_calibration &&
             command_size >= 100 &&
             app.hdr_swapchain &&
             (strcmp(app.displayed_mode, mode) || app.displayed_r != r ||
@@ -4683,7 +4870,7 @@ static void process_network_updates(void)
              app.displayed_max_luma != max_luma ||
              app.displayed_min_luma != min_luma ||
              app.displayed_max_cll != max_cll ||
-             app.displayed_max_fall != max_fall);
+             app.displayed_max_fall != max_fall));
 #endif
         char message[256] = "";
         raise_pattern_window();
@@ -4702,11 +4889,17 @@ static void process_network_updates(void)
          * when a new fullscreen HDR patch is selected, not for the per-refresh
          * redraw loop or repeated reads of the same patch. The normal meter
          * settle delay starts after the new HDR patch is acknowledged, so it
-         * cannot sample this reset frame. */
+         * cannot sample this reset frame. Full-field OLED conditioning
+         * commands opt out because recreating the HDR path can silently drop
+         * the active Windows MHC2 calibration for every following patch. */
+        if (refresh_fullscreen_hdr) SDL_SetAtomicInt(&app.presentation_recovery_pending, 0);
         if (refresh_fullscreen_hdr &&
             (!try_create_renderer(false, NULL) ||
              (SDL_Delay(50), !create_renderer(true)))) ok = false;
-        else ok = alignment ? render_alignment() : render_patch(mode, r, g, b);
+        else {
+            if (refresh_fullscreen_hdr) windows_verified_foreground();
+            ok = alignment ? render_alignment() : render_patch(mode, r, g, b);
+        }
 #else
         ok = alignment ? render_alignment() : render_patch(mode, r, g, b);
 #endif
@@ -5149,6 +5342,13 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
      * compositor idle-inhibit protocol for the lifetime of this window. */
     SDL_DisableScreenSaver();
 #ifdef _WIN32
+    /* Idle transitions degrade the HDR pipeline mid-session even with the
+     * screensaver off: unattended meter runs measured a tone-mapped panel
+     * until the session was interacted with. Assert a display requirement
+     * for the process lifetime; cleared in SDL_AppQuit. */
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+#endif
+#ifdef _WIN32
     set_windows_window_icon();
 #else
     set_embedded_window_icon();
@@ -5220,6 +5420,11 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
 {
     AppState *state = (AppState *)appstate;
     if (event->type == SDL_EVENT_QUIT) return SDL_APP_SUCCESS;
+    if (event->type == SDL_EVENT_WINDOW_HDR_STATE_CHANGED) {
+        /* The desktop's HDR state changed (for example the user just enabled
+         * HDR for the display), so a cooled-down HDR failure is stale. */
+        hdr_attempt_cooldown_until = 0;
+    }
     if (event->type == SDL_EVENT_WINDOW_HDR_STATE_CHANGED &&
         (state->renderer
 #ifdef _WIN32
@@ -5304,6 +5509,9 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
 void SDL_AppQuit(void *appstate, SDL_AppResult result)
 {
+#ifdef _WIN32
+    SetThreadExecutionState(ES_CONTINUOUS);
+#endif
     AppState *state = (AppState *)appstate;
     (void)result;
     if (state) {
